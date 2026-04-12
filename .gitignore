@@ -1,0 +1,16 @@
+.env
+venv/
+user_data/
+outputs/
+brave_profile/
+__pycache__/
+*.pyc
+ig_session.json
+*.jpg
+*.jpeg
+*.png
+*.zip
+*.key
+upload_menu_debug.png
+debug_timeout.png
+serve/
