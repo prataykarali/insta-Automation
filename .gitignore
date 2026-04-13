@@ -3,8 +3,10 @@ venv/
 user_data/
 outputs/
 brave_profile/
+brave_profile_pw/
+ig_profile/
+ig_user_data/
 __pycache__/
-*.pyc
 ig_session.json
 *.jpg
 *.jpeg
