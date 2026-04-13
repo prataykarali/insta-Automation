@@ -1,17 +1,33 @@
 """
 gemini_gen.py — Gemini generation with live Telegram progress updates
+ALL FIXES CONSOLIDATED — v4 final
 """
 import os
 import asyncio
 import time
 import base64
+import shutil
 from playwright.async_api import async_playwright
 from playwright_stealth import Stealth
 
-BRAVE_PATH   = "/usr/bin/brave-browser"
+# Auto-detect browser path (laptop = Brave, server/phone = Chromium)
+BRAVE_PATH = (
+    shutil.which("brave-browser") or
+    shutil.which("chromium-browser") or
+    shutil.which("chromium") or
+    "/usr/bin/brave-browser"
+)
+
 RESPONSE_SEL = "model-response"
 OUTPUT_DIR   = os.path.expanduser("~/AURA-Automation/outputs")
-CHAR_REF     = "/home/pratay-karali/Downloads/aura_new.jpeg"
+
+# Auto-detect character ref path
+_CHAR_REF_CANDIDATES = [
+    "/home/pratay-karali/Downloads/aura_new.jpeg",
+    os.path.expanduser("~/AURA-Automation/aura_new.jpeg"),
+    os.path.expanduser("~/aura_new.jpeg"),
+]
+CHAR_REF = next((p for p in _CHAR_REF_CANDIDATES if os.path.exists(p)), _CHAR_REF_CANDIDATES[0])
 
 
 def caption_prompt(topic):
@@ -23,11 +39,18 @@ def caption_prompt(topic):
 
 def image_prompt(topic):
     return (
-        "Look at the character image I just uploaded. Generate a Pixar/Disney 3D render "
-        "of THIS EXACT same girl (same face, dark brown skin, blue hair, "
-        "orange hoodie, purple shorts, blue sneakers) in this scene: "
-        + topic +
-        ". Full body visible, cinematic lighting, 9:16 vertical format, no text, no watermarks."
+        "Look at the character image I just uploaded. "
+        "Create a SINGLE cohesive Pixar/Disney 3D animated film still — "
+        "the character AND the entire background environment must share "
+        "the EXACT same 3D rendered art style, like a frame from a Pixar movie. "
+        "NO photorealistic backgrounds. The whole image — sky, ground, objects, "
+        "lighting, textures — must look like it was rendered in the same 3D animation "
+        "software as the character. "
+        "Character details to match exactly: dark brown skin, blue hair, "
+        "orange hoodie, purple shorts, blue sneakers, same face. "
+        "Scene: " + topic + ". "
+        "Full body visible, warm cinematic Pixar lighting, "
+        "9:16 vertical format, no text, no watermarks, no photorealism anywhere."
     )
 
 
@@ -56,121 +79,217 @@ async def _wait_stable(page, prev_count, timeout=90):
 
 
 async def _upload_file(page):
-    """Upload character reference via file chooser interception."""
-    print("[Upload] Looking for + button...")
+    """
+    Upload character reference.
+    Confirmed aria-label: 'Open upload file menu'
+    Opens a menu → clicks image item → intercepts file chooser.
+    """
+    print(f"[Upload] Using ref: {CHAR_REF}")
+    if not os.path.exists(CHAR_REF):
+        print(f"[Upload] ✗ File not found: {CHAR_REF}")
+        return False
 
-    plus_selectors = [
-        'button[aria-label="Add image"]',
-        'button[aria-label*="Add"]',
-        'button[aria-label*="attach" i]',
-        'button[aria-label*="upload" i]',
-        'button[aria-label*="image" i]',
-    ]
-
-    for sel in plus_selectors:
-        try:
-            btn = page.locator(sel).first
-            if await btn.is_visible(timeout=1500):
-                print(f"[Upload] Clicking: {sel}")
-                async with page.expect_file_chooser(timeout=6000) as fc_info:
-                    await btn.click()
-                fc = await fc_info.value
-                await fc.set_files(CHAR_REF)
-                await asyncio.sleep(5)
-                print("[Upload] ✓")
-                return True
-        except:
-            continue
-
-    # JS fallback
+    # ── Step 1: Find and click the upload button ──────────────────────────────
+    upload_btn = page.locator('button[aria-label="Open upload file menu"]')
     try:
-        clicked = await page.evaluate("""() => {
-            const box = document.querySelector('div[role="textbox"]');
-            if (!box) return false;
-            let container = box.parentElement;
-            for (let i = 0; i < 6; i++) {
-                if (!container) break;
-                const btns = container.querySelectorAll('button');
-                for (const btn of btns) {
-                    const label = (btn.getAttribute('aria-label') || '').toLowerCase();
-                    if (label.includes('add') || label.includes('attach') ||
-                        label.includes('upload') || label.includes('image')) {
-                        btn.click();
-                        return true;
-                    }
-                }
-                container = container.parentElement;
-            }
-            return false;
-        }""")
-        if clicked:
-            async with page.expect_file_chooser(timeout=5000) as fc_info:
-                pass
-            fc = await fc_info.value
-            await fc.set_files(CHAR_REF)
-            await asyncio.sleep(5)
-            print("[Upload] JS fallback ✓")
-            return True
+        await upload_btn.wait_for(state="visible", timeout=5000)
+        print("[Upload] Found 'Open upload file menu' ✓")
+    except:
+        print("[Upload] ✗ 'Open upload file menu' not found — trying fallbacks")
+        # Fallback selectors
+        for sel in [
+            'button[aria-label*="upload" i]',
+            'button[aria-label*="attach" i]',
+            'button[aria-label*="image" i]',
+            'button[aria-label*="add" i]',
+        ]:
+            try:
+                btn = page.locator(sel).first
+                if await btn.is_visible(timeout=1000):
+                    upload_btn = btn
+                    print(f"[Upload] Fallback found: {sel}")
+                    break
+            except:
+                continue
+        else:
+            return False
+
+    await upload_btn.click()
+    await asyncio.sleep(1.2)  # wait for menu animation
+
+    # Save menu debug screenshot
+    try:
+        await page.screenshot(path=os.path.join(OUTPUT_DIR, "upload_menu_debug.png"))
     except:
         pass
 
-    # Direct input fallback
-    try:
-        fi = page.locator('input[type="file"]').first
-        await fi.wait_for(state="attached", timeout=5000)
-        await fi.set_input_files(CHAR_REF)
-        await asyncio.sleep(5)
-        print("[Upload] Direct input ✓")
-        return True
-    except Exception as e:
-        print(f"[Upload] All failed: {e}")
+    # ── Step 2: Click image menu item → intercept file chooser ───────────────
+    menu_item_texts = [
+        "Add image", "Upload image", "Image", "Photo",
+        "Add photo", "Add file", "Upload file", "File",
+    ]
 
-    return False
+    clicked = False
+    for text in menu_item_texts:
+        try:
+            item = page.locator(f'[role="menuitem"]:has-text("{text}")').first
+            if await item.is_visible(timeout=800):
+                print(f"[Upload] Clicking menu item: '{text}'")
+                async with page.expect_file_chooser(timeout=5000) as fc_info:
+                    await item.click()
+                fc = await fc_info.value
+                await fc.set_files(CHAR_REF)
+                await asyncio.sleep(4)
+                print("[Upload] ✓ File chosen via menu item")
+                clicked = True
+                break
+        except:
+            continue
+
+    if not clicked:
+        # Fallback: log and click first menuitem
+        print("[Upload] Known menu texts not found — trying first visible menuitem")
+        try:
+            items = page.locator('[role="menuitem"]')
+            count = await items.count()
+            print(f"[Upload] Found {count} menuitem(s)")
+            for i in range(count):
+                text = await items.nth(i).inner_text()
+                print(f"[Upload]   [{i}] '{text.strip()}'")
+            if count > 0:
+                async with page.expect_file_chooser(timeout=5000) as fc_info:
+                    await items.first.click()
+                fc = await fc_info.value
+                await fc.set_files(CHAR_REF)
+                await asyncio.sleep(4)
+                clicked = True
+                print("[Upload] ✓ Fallback first menuitem")
+        except Exception as e:
+            print(f"[Upload] Fallback failed: {e}")
+
+    if not clicked:
+        print("[Upload] ✗ All upload approaches failed")
+        return False
+
+    # ── Step 3: Verify thumbnail appeared in DOM ──────────────────────────────
+    await asyncio.sleep(2)
+    try:
+        await page.wait_for_function("""() => {
+            const imgs = [...document.querySelectorAll('img')];
+            return imgs.some(img =>
+                img.src.startsWith('blob:') && img.naturalWidth > 30
+            );
+        }""", timeout=10000)
+        print("[Upload] ✓ Thumbnail confirmed in DOM")
+    except:
+        print("[Upload] ⚠️ No thumbnail confirmed — continuing anyway")
+
+    return True
 
 
 async def _wait_for_image(page, timeout=300, progress_cb=None):
     """
-    Wait for image generation with live progress callbacks to Telegram.
-    Sends status every 30s so user isn't staring at nothing.
+    Wait for Gemini's generated image.
+    - Scrolls last response into view each cycle (fixes lazy-load naturalWidth=0)
+    - Searches ONLY inside last model-response (not document-wide)
+    - Records and excludes the uploaded ref blob URL
+    - Falls back to shadow DOM walk and larger blob search
     """
     deadline = time.time() + timeout
-    start = time.time()
+    start    = time.time()
     last_update = time.time()
-    update_interval = 30  # send progress every 30 seconds
+    update_interval = 30
 
+    # Record ref blob URL to exclude it
+    ref_blob_url = await page.evaluate("""() => {
+        const imgs = [...document.querySelectorAll('img')];
+        const ref = imgs.find(img => img.src.startsWith('blob:') && img.naturalWidth > 30);
+        return ref ? ref.src : null;
+    }""")
+    print(f"[Image] Ref blob to exclude: {ref_blob_url}")
     print(f"[Image] Waiting up to {timeout}s...")
 
     while time.time() < deadline:
+        # Scroll into view → triggers lazy image loading
+        try:
+            await page.locator(RESPONSE_SEL).last.scroll_into_view_if_needed(timeout=2000)
+        except:
+            pass
+
         src = await page.evaluate(f"""() => {{
+            const refused = ["can't generate", "cannot create", "unable to generate",
+                             "i'm not able", "i can't help", "i'm unable",
+                             "i apologize", "i'm sorry"];
+            const REF_BLOB = {f'"{ref_blob_url}"' if ref_blob_url else 'null'};
+
             const rs = document.querySelectorAll('{RESPONSE_SEL}');
             if (!rs.length) return null;
             const last = rs[rs.length - 1];
             const txt = (last.innerText || '').toLowerCase();
-            const refused = ["can't generate", "cannot create", "unable to generate",
-                             "i'm not able", "i can't help", "i'm unable"];
+
             if (refused.some(r => txt.includes(r))) return 'REFUSED';
             if (txt.includes('creating your image')) return 'GENERATING';
-            const imgs = [...last.querySelectorAll('img')].filter(img => {{
+
+            function goodImg(img) {{
                 const s = img.src || '';
-                return img.naturalWidth >= 200 && img.naturalHeight >= 200 &&
-                       !s.includes('avatar') && !s.includes('icon') && !s.includes('logo');
+                if (!s || s === REF_BLOB) return false;
+                if (s.includes('avatar') || s.includes('icon') ||
+                    s.includes('logo') || s.includes('favicon')) return false;
+                const tooSmall = img.naturalWidth > 0 && img.naturalWidth < 100
+                              && img.naturalHeight > 0 && img.naturalHeight < 100;
+                if (tooSmall) return false;
+                return img.naturalWidth >= 200 || img.naturalHeight >= 200
+                    || img.width >= 200 || img.height >= 200
+                    || s.startsWith('blob:');
+            }}
+
+            function biggest(imgs) {{
+                imgs.sort((a,b) =>
+                    (b.naturalWidth||b.width||0)*(b.naturalHeight||b.height||0) -
+                    (a.naturalWidth||a.width||0)*(a.naturalHeight||a.height||0));
+                return imgs[0].src;
+            }}
+
+            // Strategy 1: direct children of last model-response
+            const direct = [...last.querySelectorAll('img')].filter(goodImg);
+            if (direct.length) return biggest(direct);
+
+            // Strategy 2: walk shadow DOM under last model-response
+            function deepImgs(root) {{
+                const out = [];
+                const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+                let node;
+                while (node = walker.nextNode()) {{
+                    if (node.shadowRoot) out.push(...deepImgs(node.shadowRoot));
+                    if (node.tagName === 'IMG') out.push(node);
+                }}
+                return out;
+            }}
+            const deep = deepImgs(last).filter(goodImg);
+            if (deep.length) return biggest(deep);
+
+            // Strategy 3: any large blob on page that isn't the ref
+            const allBlobs = [...document.querySelectorAll('img')].filter(img => {{
+                const s = img.src || '';
+                if (!s.startsWith('blob:') || s === REF_BLOB) return false;
+                return img.naturalWidth >= 300 || img.width >= 300;
             }});
-            if (!imgs.length) return null;
-            imgs.sort((a,b) => (b.naturalWidth*b.naturalHeight)-(a.naturalWidth*a.naturalHeight));
-            return imgs[0].src;
+            if (allBlobs.length) return biggest(allBlobs);
+
+            return null;
         }}""")
 
         if src == 'REFUSED':
+            print("[Image] Gemini refused")
             return None
-        if src and src != 'GENERATING':
+        if src and src != 'GENERATING' and src != 'null':
             elapsed = int(time.time() - start)
-            print(f"[Image] Done in {elapsed}s ✓")
+            print(f"[Image] Done in {elapsed}s ✓  src={src[:80]}")
             return src
 
-        # Send progress update to Telegram every 30s
         now = time.time()
         if progress_cb and (now - last_update) >= update_interval:
-            elapsed = int(now - start)
+            elapsed   = int(now - start)
             remaining = int(deadline - now)
             status = "🖌️ Gemini is painting..." if src == 'GENERATING' else "⏳ Starting generation..."
             await progress_cb(f"{status}\n_{elapsed}s elapsed, up to {remaining}s remaining_")
@@ -178,15 +297,61 @@ async def _wait_for_image(page, timeout=300, progress_cb=None):
 
         remaining = int(deadline - time.time())
         print(f"[Image] {'Generating' if src == 'GENERATING' else 'Waiting'}... {remaining}s left")
-        await asyncio.sleep(5)
+        await asyncio.sleep(3)
 
+    # Timeout — dump all imgs for diagnosis
+    print("[Image] TIMEOUT — dumping all imgs:")
+    all_imgs = await page.evaluate("""() =>
+        [...document.querySelectorAll('img')].map(img => ({
+            src: img.src?.slice(0,80),
+            w: img.naturalWidth || img.width,
+            h: img.naturalHeight || img.height
+        }))
+    """)
+    for img in all_imgs:
+        print(f"  {img}")
     return None
 
 
 async def _download_image(page, context, img_src, save_path):
-    """Download just the image pixels — no UI chrome."""
+    """Download generated image — handles both blob: and https: URLs."""
 
-    # Method 1: Playwright context fetch
+    if img_src.startswith('blob:'):
+        print("[Download] Blob URL — using in-page fetch")
+        try:
+            safe = img_src.replace('`', '\\`')
+            b64 = await page.evaluate(f"""async () => {{
+                const src = `{safe}`;
+                try {{
+                    const resp = await fetch(src);
+                    const buf  = await resp.arrayBuffer();
+                    const bytes = new Uint8Array(buf);
+                    let bin = '';
+                    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+                    return btoa(bin);
+                }} catch(e) {{
+                    const img = [...document.querySelectorAll('img')].find(i => i.src === src);
+                    if (!img) return null;
+                    await new Promise(r => {{ if(img.complete) r(); else {{img.onload=r;img.onerror=r;}} }});
+                    const c = document.createElement('canvas');
+                    c.width  = img.naturalWidth  || img.width  || 512;
+                    c.height = img.naturalHeight || img.height || 512;
+                    c.getContext('2d').drawImage(img, 0, 0);
+                    return c.toDataURL('image/png').split(',')[1];
+                }}
+            }}""")
+            if b64:
+                raw = base64.b64decode(b64)
+                if len(raw) > 10000:
+                    with open(save_path, "wb") as f:
+                        f.write(raw)
+                    print(f"[Download] Blob ✓ — {len(raw):,}b")
+                    return True
+        except Exception as e:
+            print(f"[Download] Blob failed: {e}")
+        return False
+
+    # Method 1: context fetch
     try:
         resp = await context.request.get(img_src, timeout=30000)
         if resp.ok:
@@ -199,10 +364,10 @@ async def _download_image(page, context, img_src, save_path):
     except Exception as e:
         print(f"[Download] M1: {e}")
 
-    # Method 2: Navigate to URL
+    # Method 2: navigate in new page
     try:
         p2 = await context.new_page()
-        r = await p2.goto(img_src, timeout=30000)
+        r  = await p2.goto(img_src, timeout=30000)
         data = await r.body()
         await p2.close()
         if len(data) > 10000:
@@ -213,15 +378,16 @@ async def _download_image(page, context, img_src, save_path):
     except Exception as e:
         print(f"[Download] M2: {e}")
 
-    # Method 3: Canvas export — full resolution, zero chrome
+    # Method 3: canvas export
     try:
         safe = img_src.replace('`', '\\`')
-        b64 = await page.evaluate(f"""async () => {{
+        b64  = await page.evaluate(f"""async () => {{
             const img = [...document.querySelectorAll('img')].find(i => i.src===`{safe}`);
             if (!img) return null;
             await new Promise(r => {{ if(img.complete) r(); else {{img.onload=r;img.onerror=r;}} }});
             const c = document.createElement('canvas');
-            c.width = img.naturalWidth; c.height = img.naturalHeight;
+            c.width  = img.naturalWidth  || img.width  || 512;
+            c.height = img.naturalHeight || img.height || 512;
             c.getContext('2d').drawImage(img, 0, 0);
             return c.toDataURL('image/png').split(',')[1];
         }}""")
@@ -235,15 +401,14 @@ async def _download_image(page, context, img_src, save_path):
     except Exception as e:
         print(f"[Download] M3: {e}")
 
-    # Method 4: Element screenshot (crops to exact img bounds)
+    # Method 4: element screenshot
     try:
         el = page.locator(f'img[src="{img_src}"]').first
         await el.scroll_into_view_if_needed()
         await asyncio.sleep(1)
         await el.screenshot(path=save_path, type="png")
-        size = os.path.getsize(save_path)
-        if size > 10000:
-            print(f"[Download] Element screenshot ✓ — {size:,}b")
+        if os.path.getsize(save_path) > 10000:
+            print(f"[Download] Element screenshot ✓")
             return True
     except Exception as e:
         print(f"[Download] M4: {e}")
@@ -253,7 +418,7 @@ async def _download_image(page, context, img_src, save_path):
 
 async def generate(topic: str, progress_cb=None) -> dict:
     """
-    Main entry. progress_cb(msg) is called with status updates for Telegram.
+    Main entry point.
     Returns: { "caption": str, "image_path": str, "error": str|None }
     """
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -271,6 +436,7 @@ async def generate(topic: str, progress_cb=None) -> dict:
             ]
         )
         page = await context.new_page()
+        await page.set_viewport_size({"width": 1280, "height": 900})
 
         try:
             if progress_cb:
@@ -295,9 +461,9 @@ async def generate(topic: str, progress_cb=None) -> dict:
             await page.keyboard.press("Enter")
             await _wait_stable(page, prev, timeout=90)
 
-            raw = await page.locator(RESPONSE_SEL).last.inner_text()
+            raw   = await page.locator(RESPONSE_SEL).last.inner_text()
             lines = [l.strip() for l in raw.strip().split("\n") if l.strip()]
-            skip = ["here", "sure", "okay", "of course", "great", "gemini", "creating"]
+            skip  = ["here", "sure", "okay", "of course", "great", "gemini", "creating"]
             seen, deduped = set(), []
             for l in lines:
                 if l not in seen and not any(l.lower().startswith(s) for s in skip):
@@ -307,7 +473,7 @@ async def generate(topic: str, progress_cb=None) -> dict:
             result["caption"] = caption
             print("[Caption] Done ✓")
 
-            # ── Step 2: Image ─────────────────────────────────────────────
+            # ── Step 2: Fresh chat for image ──────────────────────────────
             if progress_cb:
                 await progress_cb("🎨 Starting fresh chat for image generation...")
 
@@ -321,20 +487,27 @@ async def generate(topic: str, progress_cb=None) -> dict:
             uploaded = await _upload_file(page)
 
             if progress_cb:
-                ref_status = "✓ Character uploaded!" if uploaded else "⚠️ Upload failed, using text description"
+                ref_status = "✓ Character uploaded!" if uploaded else "⚠️ Upload failed — using text description"
                 await progress_cb(f"{ref_status}\n🖌️ Sending image prompt to Gemini...")
 
+            # Send image prompt
             prev = await page.locator(RESPONSE_SEL).count()
             await page.fill(box, image_prompt(topic))
             await page.keyboard.press("Enter")
-            await _wait_stable(page, prev, timeout=30)
 
-            # Wait for image with progress updates
+            # Wait for response element to appear (no _wait_stable — goes straight to image gen)
+            deadline_appear = time.time() + 15
+            while time.time() < deadline_appear:
+                if await page.locator(RESPONSE_SEL).count() > prev:
+                    break
+                await asyncio.sleep(0.5)
+
+            # Wait for generated image
             img_src = await _wait_for_image(page, timeout=300, progress_cb=progress_cb)
 
             if not img_src:
                 debug = os.path.join(OUTPUT_DIR, "debug_timeout.png")
-                await page.screenshot(path=debug)
+                await page.screenshot(path=debug, full_page=True)
                 result["error"] = f"timeout — debug saved to {debug}"
                 return result
 
